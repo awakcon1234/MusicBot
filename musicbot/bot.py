@@ -331,27 +331,10 @@ class MusicBot(discord.Client):
                 self.config.spotify_enabled = False
                 time.sleep(5)  # make sure they see the problem
         else:
-            try:
-                log.warning(
-                    "The config did not have Spotify app credentials, attempting to use guest mode."
-                )
-                self.spotify = Spotify(
-                    None, None, aiosession=self.session, loop=self.loop
-                )
-                if not await self.spotify.has_token():
-                    log.warning("Spotify did not provide us with a token. Disabling.")
-                    self.config.spotify_enabled = False
-                else:
-                    log.info(
-                        "Authenticated with Spotify successfully using guest mode."
-                    )
-                    self.config.spotify_enabled = True
-            except exceptions.SpotifyError as e:
-                log.warning(
-                    "Could not start Spotify client using guest mode. Details: %s.",
-                    e.message % e.fmt_args,
-                )
-                self.config.spotify_enabled = False
+            log.warning(
+                "Your config does not have Spotify app credentials. Spotify support will not be available."
+            )
+            self.config.spotify_enabled = False
 
         log.info("Initialized, now connecting to discord.")
         # this creates an output similar to a progress indicator.
@@ -1174,9 +1157,21 @@ class MusicBot(discord.Client):
                     if potential_channel and potential_channel.guild == guild:
                         np_channel = potential_channel
                         break
+            elif self.config.bound_channels:
+                for potential_channel_id in self.config.bound_channels:
+                    potential_channel = self.get_channel(potential_channel_id)
+                    if isinstance(potential_channel, discord.abc.PrivateChannel):
+                        continue
 
-            if not np_channel and last_np_msg:
-                np_channel = last_np_msg.channel
+                    if not isinstance(potential_channel, discord.abc.Messageable):
+                        continue
+
+                    if potential_channel and potential_channel.guild == guild:
+                        np_channel = potential_channel
+                        break
+
+            if not np_channel and ssd_.last_np_channel:
+                np_channel = ssd_.last_np_channel  # type: ignore[assignment]
 
         content = Response("")
         if entry.thumbnail_url:
@@ -1186,6 +1181,10 @@ class MusicBot(discord.Client):
                 "No thumbnail set for entry with URL: %s",
                 entry.url,
             )
+
+        if len(entry.url) <= 1024:
+            # TRANSLATORS:  URL field title for embeds.
+            content.add_field(name=_D("URL:", ssd_), value=entry.url, inline=False)
 
         if self.config.now_playing_mentions:
             content.title = None
@@ -3332,7 +3331,7 @@ class MusicBot(discord.Client):
         # fmt: on
         desc=_Dd(
             "Manage auto playlist files and per-guild settings.\n"
-            "Auto playlists use a their own queue, only playing when the main queue is empty."
+            "Auto playlists use their own queue, only playing when the main queue is empty."
         ),
         remap_subs={"+": "add", "-": "remove"},
     )
@@ -4427,17 +4426,18 @@ class MusicBot(discord.Client):
 
             # if the result has "entries" but it's empty, it might be a failed search.
             if "entries" in info and not info.entry_count:
-                if check_extractor(info.extractor, "youtube:search"):
+                if check_extractor(info.extractor, "search"):
                     # TOOD: UI, i18n stuff
                     raise exceptions.CommandError(
-                        "YouTube search returned no results for:  %(url)s",
-                        fmt_args={"url": song_url},
+                        "Search returned no results with %(extractor)s for:  %(url)s",
+                        fmt_args={"url": song_url, "extractor": info.extractor},
                     )
 
             # If the result has usable entries, we assume it is a playlist
+            # but with only one entry is may be a search result.
             listlen = 1
             track_title = ""
-            if info.has_entries:
+            if info.has_entries and info.entry_count > 1:
                 await self._do_playlist_checks(player, author, info)
 
                 num_songs = info.playlist_count or info.entry_count
@@ -5034,7 +5034,8 @@ class MusicBot(discord.Client):
                 inline=False,
             )
             if len(entry.url) <= 1024:
-                content.add_field(name="URL:", value=entry.url, inline=False)
+                # TRANSLATORS:  URL field title for embeds.
+                content.add_field(name=_D("URL:", ssd_), value=entry.url, inline=False)
             if entry.thumbnail_url:
                 content.set_image(url=entry.thumbnail_url)
             else:
@@ -5291,10 +5292,18 @@ class MusicBot(discord.Client):
         return Response(_D("Cleared all songs from the queue.", ssd_))
 
     @command_helper(
-        usage=["{cmd} [POSITION]"],
+        usage=[
+            "{cmd} [POSITION]\n"
+            + _Dd("    Remove a song at the end of the queue or at [POSITION].\n"),
+            "{cmd} <FROM> <TO>\n"
+            + _Dd("    Remove songs from position FROM to position TO.\n"),
+            "{cmd} <@USER>\n" + _Dd("    Remove songs added by the mentioned user.\n"),
+        ],
         desc=_Dd(
-            "Remove a song from the queue, optionally at the given queue position.\n"
-            "If the position is omitted, the song at the end of the queue is removed.\n"
+            "Remove a song from the queue at POSITION specified.\n"
+            "Remove multiple songs from the queue from position FROM to position TO specified.\n"
+            "Remove all songs from the queue added by the mentioned user.\n"
+            "If the user-mention, position or positions are omitted, the song at the end of the queue is removed.\n"
             "Use the queue command to find position number of your track.\n"
             "However, positions of all songs are changed when a new song starts playing.\n"
         ),
@@ -5306,15 +5315,69 @@ class MusicBot(discord.Client):
         author: discord.Member,
         permissions: PermissionGroup,
         player: MusicPlayer,
-        index: str = "",
+        leftover_args: List[str],
+        position: str = "",
     ) -> CommandResponse:
         """
-        Command to remove entries from the player queue using relative IDs or LIFO method.
+        Command to remove entries from the player queue.
+        You can:
+        - Provide one position: `remove 3` removes song at position 3.
+        - Provide two positions: `remove 3 6` removes songs 3 through 6.
+        - Mention a user: `remove @user` removes their entries.
+        - Provide nothing: `remove` removes the last song. (LIFO-style)
         """
 
         if not player.playlist.entries:
             raise exceptions.CommandError("Nothing in the queue to remove!")
 
+        # removing range (2 positions used, FROM and TO)
+        if len(leftover_args) == 1:
+            indexes = []
+            try:
+                indexes.append(int(position) - 1)
+                indexes.append(int(leftover_args[0]) - 1)
+            except (ValueError, IndexError) as e:
+                raise exceptions.CommandError("Song positions must be integers!") from e
+
+            for i in indexes:
+                if i < 0 or i > len(player.playlist.entries) - 1:
+                    raise exceptions.CommandError(
+                        "Invalid positions. Use the queue command to find queue positions."
+                    )
+
+            # if wrong indices are the wrong order, simply reverse order
+            if indexes[0] > indexes[1]:
+                temp_index = indexes[0]
+                indexes[0] = indexes[1]
+                indexes[1] = temp_index
+
+            permission_to_remove = permissions.remove
+
+            # checks to see if all authors of entries to be removed is the same as the user running the cmd
+            if not permission_to_remove:
+                # Collects the authors of playlist entries from the given range
+                authors = [
+                    player.playlist.get_entry_at_index(idx).author
+                    for idx in range(indexes[0], indexes[1] + 1)
+                ]
+                permission_to_remove = set(authors) == {author}
+
+            if not permission_to_remove:
+                raise exceptions.PermissionsError(
+                    "You do not have the permission to remove all the songs in the given range from the queue.\n"
+                )
+
+            player.playlist.removerange(indexes[0], indexes[1])
+
+            return Response(
+                _D(
+                    "Successfully removed songs %(from)s through %(to)s!",
+                    ssd_,
+                )
+                % {"from": indexes[0] + 1, "to": indexes[1] + 1},
+            )
+
+        # else: (if no range is set, but user-mentions is set.)
         if user_mentions:
             for user in user_mentions:
                 if permissions.remove or author == user:
@@ -5342,18 +5405,20 @@ class MusicBot(discord.Client):
                     "You do not have the permission to remove that entry from the queue.\n"
                     "You must be the one who queued it or have instant skip permissions.",
                 )
+        # End user-mentions.
 
-        if not index:
+        # if no argument was given, get the last item in the queue.
+        if not position:
             idx = len(player.playlist.entries)
+        else:
+            try:
+                idx = int(position)
+            except (TypeError, ValueError) as e:
+                raise exceptions.CommandError(
+                    "Invalid entry number. Use the queue command to find queue positions.",
+                ) from e
 
-        try:
-            idx = int(index)
-        except (TypeError, ValueError) as e:
-            raise exceptions.CommandError(
-                "Invalid entry number. Use the queue command to find queue positions.",
-            ) from e
-
-        if idx > len(player.playlist.entries):
+        if idx < 1 or idx > len(player.playlist.entries):
             raise exceptions.CommandError(
                 "Invalid entry number. Use the queue command to find queue positions.",
             )
@@ -6335,6 +6400,7 @@ class MusicBot(discord.Client):
 
         # add the tracks to the embed fields
         tracks_list = ""
+        tracks_per_page = 0
         queue_segment = list(player.playlist.entries)[start_index:end_index]
         for idx, item in enumerate(queue_segment, starting_at):
             if item == player.current_entry:
@@ -6346,12 +6412,31 @@ class MusicBot(discord.Client):
             if item.channel and item.author:
                 added_by = item.author.name
 
-            tracks_list += _D(
+            # shorten the titles to get more tracks in the list.
+            title = item.title
+            if len(item.title) > 40:
+                title = item.title[:40] + " ..."
+
+            next_track_list = _D(
                 "**Entry #%(index)s:**"
                 "Title: `%(title)s`\n"
                 "Added by: `%(user)s`\n\n",
                 ssd_,
-            ) % {"index": idx, "title": _D(item.title, ssd_), "user": added_by}
+            ) % {"index": idx, "title": _D(title, ssd_), "user": added_by}
+            # We limit the track list, and leave extra space for the rest of the description text.
+            if (len(tracks_list) + len(next_track_list)) < 3840:
+                tracks_per_page += 1
+                tracks_list += next_track_list
+
+        if (
+            self.config.queue_length > tracks_per_page
+            and total_entry_count > self.config.queue_length
+        ):
+            log.warning(
+                "You may have QueueLength set too high! "
+                "The setting is %(option)d but we could only list %(count)d tracks.",
+                {"option": self.config.queue_length, "count": tracks_per_page},
+            )
 
         embed = Response(
             _D(

@@ -20,7 +20,7 @@ from yt_dlp.networking.exceptions import (  # type: ignore[import-untyped]
 from yt_dlp.utils import DownloadError  # type: ignore[import-untyped]
 from yt_dlp.utils import UnsupportedError
 
-from .constants import DEFAULT_MAX_INFO_DL_THREADS, DEFAULT_MAX_INFO_REQUEST_TIMEOUT
+from .constants import DEFAULT_MAX_INFO_REQUEST_TIMEOUT
 from .exceptions import ExtractionError, MusicbotException
 from .i18n import _L
 from .spotify import Spotify
@@ -70,7 +70,7 @@ class YtdlpLogHook:
 ytdl_format_options_immutable = MappingProxyType(
     {
         "format": "bestaudio/best",
-        "outtmpl": "%(extractor)s-%(id)s-%(title)s-%(qhash)s.%(ext)s",
+        "outtmpl": "%(extractor)s-%(id)s-%(title).64B-%(qhash)s.%(ext)s",
         "restrictfilenames": True,
         "noplaylist": True,
         "nocheckcertificate": True,
@@ -89,8 +89,18 @@ ytdl_format_options_immutable = MappingProxyType(
 )
 
 
-# Fuck your useless bugreports message that gets two link embeds and confuses users
-youtube_dl.utils.bug_reports_message = lambda: ""
+def _ytdlp_bug_msg(*_args: Any, **_kwargs: Any) -> str:
+    """
+    Removes bug report text from exceptions to clean them up for musicbot.
+    It also issues a debug message to let users/devs know that ytdlp thinks the
+    error could be a bug worth reporting.
+    """
+    log.debug("YTDLP thinks there may be a bug in processing.")
+    return ""
+
+
+youtube_dl.utils.bug_reports_message = _ytdlp_bug_msg
+
 
 """
     Alright, here's the problem.  To catch youtube-dl errors for their useful information, I have to
@@ -111,7 +121,7 @@ class Downloader:
         self.download_folder: pathlib.Path = bot.config.audio_cache_path
         # NOTE: this executor may not be good for long-running downloads...
         self.thread_pool = ThreadPoolExecutor(
-            max_workers=DEFAULT_MAX_INFO_DL_THREADS,
+            max_workers=bot.config.downloader_threads_max,
             thread_name_prefix="MB_Downloader",
         )
         self._supported_search = [
@@ -138,6 +148,12 @@ class Downloader:
         # apply source address settings.
         if bot.config.ytdlp_source_address != "*":
             ytdl_format_options["source_address"] = bot.config.ytdlp_source_address
+
+        # apply download concurrency settings.
+        if bot.config.ytdlp_concurrent_frags > 1:
+            ytdl_format_options["concurrent_fragment_downloads"] = (
+                bot.config.ytdlp_concurrent_frags
+            )
 
         # enable verbose ytdlp logs if debug mode is enabled.
         if bot.config.debug_mode:
@@ -560,7 +576,7 @@ class Downloader:
             and len(data.get("entries", [])) == 1
             and isinstance(data.get("entries", None), list)
             and data.get("playlist_count", 0) == 1
-            and not any(song_subject.startswith(e) for e in self._supported_search)
+            and any(song_subject.startswith(e) for e in self._supported_search)
         ):
             log.noise(  # type: ignore[attr-defined]
                 "Extractor %(extractor)s returned single-entry result, replacing base info with entry info.",
@@ -569,7 +585,6 @@ class Downloader:
             entry_info = copy.deepcopy(data["entries"][0])
             for key in entry_info:
                 data[key] = entry_info[key]
-            del data["entries"]
 
         return data
 

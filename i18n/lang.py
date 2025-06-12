@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+MusicBot Lang Tool
+A collection of functions useful to manage translations in PO/MO formats.
+Learn more by using:
+  lang.py --help
+
+
+Requirements:
+- polib
+
+Optional:
+- marko
+- argostranslate
+
+"""
 
 import argparse
 import difflib
@@ -6,6 +21,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -225,7 +241,7 @@ class LangTool:
         Short simply excludes the file:line comments from the diff output.
         """
         print("Preparing diff for source strings...")
-        short_ignore = ["@@", "+#:", "-#:"]
+        short_ignore = ["@@", "+#", "-#"]
         self._do_diff = True
         self.extract()
 
@@ -429,6 +445,7 @@ class LangTool:
                 po.merge(pot_msgs)
 
             pct = self._colorize_percent(po.percent_translated())
+            po.metadata["Project-Id-Version"] = self.version
             po.save()
             print(
                 f"Updated: {locale} - {po_file.name} Was {pre_pct} translated, now {pct}"
@@ -579,12 +596,81 @@ class LangTool:
                 entry.flags.append("machine-translated")
             po.save()
 
+    def check_and_compile(self):
+        """Checks and re-compiles mo files if po file meta data does not match."""
+        self._check_polib()
+        import polib  # pylint: disable=import-error,useless-suppression
+
+        def _cmp_msgstr(a, b):
+            for pt_str in a:
+                if pt_str not in b:
+                    return False
+            return True
+
+        print("Checking and compiling mo files...")
+        for po_file in self.basedir.glob(self._po_file_pattern):
+            mo_file = po_file.with_suffix(".mo")
+            locale = po_file.parent.parent.name
+            if self.args.lang and self.args.lang != locale:
+                continue
+
+            po = polib.pofile(po_file)
+
+            if not mo_file.is_file():
+                po.save_as_mofile(mo_file)
+                print("Compiled missing file: ", mo_file)
+                continue
+
+            mo = polib.mofile(mo_file)
+            if mo.metadata != po.metadata:
+                po.save_as_mofile(mo_file)
+                print("Re-compiled due to headers: ", mo_file)
+                continue
+
+            # check translated strings for differences.
+            po_mstr = [e.msgstr for e in po.translated_entries()]
+            mo_mstr = [e.msgstr for e in mo.translated_entries()]
+            if not _cmp_msgstr(po_mstr, mo_mstr):
+                po.save_as_mofile(mo_file)
+                print("Re-compiled due to translations: ", mo_file)
+                continue
+
+    def mk_new_lang(self, lang_code: str) -> None:
+        """
+        Makes all the required directories and files for a new language.
+        """
+        self._check_polib()
+        import polib  # pylint: disable=import-error,useless-suppression
+
+        langpath = self.basedir.joinpath(lang_code, "LC_MESSAGES")
+        logpath = langpath.joinpath(self._logs_pot_path.stem).with_suffix(".po")
+        msgpath = langpath.joinpath(self._msgs_pot_path.stem).with_suffix(".po")
+        if langpath.exists():
+            print("Language already exists with code: ", lang_code)
+            return
+
+        langpath.mkdir(parents=True)
+
+        shutil.copy(self._logs_pot_path, logpath)
+        po = polib.pofile(logpath)
+        po.metadata["Language"] = lang_code
+        po.metadata["Content-Type"] = "text/plain; charset=UTF-8"
+        po.save()
+        print("Created: ", logpath)
+
+        shutil.copy(self._msgs_pot_path, msgpath)
+        po = polib.pofile(msgpath)
+        po.metadata["Language"] = lang_code
+        po.metadata["Content-Type"] = "text/plain; charset=UTF-8"
+        po.save()
+        print("Created: ", msgpath)
+
 
 def main():
     """MusicBot i18n tool entry point."""
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=("Helper tool for i18n tasks in MusicBot."),
+        description=("A tool for translation related tasks in MusicBot."),
         epilog=(
             "For more help and support with this bot, join our discord:"
             "\n  https://discord.gg/bots\n\n"
@@ -593,6 +679,7 @@ def main():
         ),
     )
 
+    # option: -L  lang
     ap.add_argument(
         "-L",
         dest="lang",
@@ -602,34 +689,39 @@ def main():
         metavar="LOCALE",
     )
 
+    # option: -c  do_compile
     ap.add_argument(
         "-c",
         dest="do_compile",
         action="store_true",
-        help="Compile existing PO files into MO files.",
+        help="Compile existing translation PO files into MO files.",
     )
 
+    # option: -e  do_extract
     ap.add_argument(
         "-e",
         dest="do_extract",
         action="store_true",
-        help="Extract strings to POT files.",
+        help="Extract strings from source-code to POT files (blank translation templates.)",
     )
 
+    # option: -d  do_diff_short
     ap.add_argument(
         "-d",
         dest="do_diff_short",
         action="store_true",
-        help="Diff new extractions to the existing POT file.  Ignores location comment changes.",
+        help="Show differences between source-code extractions and the existing POT files.",
     )
 
+    # option: -D  do_diff_long
     ap.add_argument(
         "-D",
         dest="do_diff_long",
         action="store_true",
-        help="Same as -d but show all changes.",
+        help="Same as argument -d but shows all changes, instead of hiding comments and flags.",
     )
 
+    # option: -t  do_testlang
     ap.add_argument(
         "-t",
         dest="do_testlang",
@@ -637,6 +729,7 @@ def main():
         help="Create or update the 'xx' test language.",
     )
 
+    # option: -s  do_stats
     ap.add_argument(
         "-s",
         dest="do_stats",
@@ -644,32 +737,57 @@ def main():
         help="Show translation stats for existing PO files, by extracting strings from sources first.",
     )
 
+    # option: -sJ  save_json with do_stats
     ap.add_argument(
         "-J",
         dest="save_json",
         action="store_true",
-        help="Save stats to JSON for use in the repository.",
+        help="Save stats to JSON for use in the repository. Use with -s option.",
     )
 
+    # option: -sB  save_badges with do_stats
     ap.add_argument(
         "-B",
         dest="save_badges",
         action="store_true",
-        help="Save stats will save badges to use in the repository.",
+        help="Save stats will save badges to use in the repository. Use with -s option.",
     )
 
+    # option: -u  do_update
     ap.add_argument(
         "-u",
         dest="do_update",
         action="store_true",
-        help="Update existing POT files and then update existing PO files.",
+        help=(
+            "Update all existing translation files (PO & POT) from source-code. "
+            "Existing translation files will have new strings to translate."
+        ),
     )
 
+    # option: -A  do_argostranslate
     ap.add_argument(
         "-A",
         dest="do_argostranslate",
         action="store_true",
-        help="Update all missing translations with Argos-translate machine translations.",
+        help="Update all missing translations in PO files with Argos-translate machine translations.",
+    )
+
+    # option: --new  new_lang
+    ap.add_argument(
+        "--new",
+        dest="new_lang",
+        type=str,
+        default="",
+        metavar="LOCALE",
+        help="Create a new language with code LOCALE. This creates folders and PO files ready for translation.",
+    )
+
+    # option: --jit-mo  jit_mo
+    ap.add_argument(
+        "--jit-mo",
+        dest="jit_mo",
+        action="store_true",
+        help="Automatically compile MO files if PO files contain different translations or headers.",
     )
 
     _args = ap.parse_args()
@@ -686,6 +804,10 @@ def main():
         sys.exit(1)
 
     langtool = LangTool(_args, _basedir)
+
+    if _args.new_lang:
+        langtool.mk_new_lang(_args.new_lang)
+        sys.exit(0)
 
     if _args.do_diff_short or _args.do_diff_long:
         langtool.diff(short=not _args.do_diff_long)
@@ -710,6 +832,9 @@ def main():
 
     if _args.do_compile:
         langtool.compile()
+
+    if _args.jit_mo:
+        langtool.check_and_compile()
 
 
 if __name__ == "__main__":
